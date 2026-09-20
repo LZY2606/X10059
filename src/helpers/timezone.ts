@@ -286,3 +286,128 @@ export function createTimePoint(
 ): TimePoint {
   return { y, m, d, h, i, s, tz };
 }
+
+/**
+ * Classification of a nominal local wall time with respect to a DST transition.
+ *
+ * - "regular": the wall time exists exactly once
+ * - "gap": the wall time does not exist (spring forward). `instant` is the
+ *   first existing instant after the gap, preserving the historical
+ *   `fromTZ()` mapping.
+ * - "overlap": the wall time exists twice (fall back). `instant` is the first
+ *   occurrence, and `secondInstant` is the second occurrence.
+ */
+export type LocalTimeKind = "regular" | "gap" | "overlap";
+
+export interface ResolvedLocalTime {
+  kind: LocalTimeKind;
+  /** UTC instant chosen for the nominal local time (post-gap instant for gaps, first occurrence for overlaps). */
+  instant: Date;
+  /** Second UTC instant carrying the same local wall time, set only for overlaps. */
+  secondInstant?: Date;
+  /** UTC offset in milliseconds that applies at `instant`. */
+  offsetMs: number;
+  /** UTC offset in milliseconds that applies at `secondInstant`, set only for overlaps. */
+  secondOffsetMs?: number;
+}
+
+/**
+ * UTC offset (wall-time-minus-utc) in milliseconds that `tz` applies at `instant`.
+ */
+function offsetAt(instantMs: number, tz: string): number {
+  const wall = toTZ(new Date(instantMs), tz);
+  return Date.UTC(wall.y, wall.m - 1, wall.d, wall.h, wall.i, wall.s) - instantMs;
+}
+
+/**
+ * Explicit DST transition guard.
+ *
+ * The calendar search core works entirely in nominal wall-time components.
+ * Before such a wall time is converted back to a real UTC instant it passes
+ * this guard, which makes the two ambiguous DST situations explicit instead
+ * of letting them surface as unexplained minute skips:
+ *
+ *  1. A non-existent local time ("gap") maps to the first existing instant
+ *     after the gap, preserving Croner's historical mapping.
+ *  2. A repeated local time ("overlap") resolves deterministically to the
+ *     first occurrence, with the second occurrence reported alongside it.
+ *
+ * The guard does not hard-code a 60-minute transition size. It reads the
+ * offsets two nominal hours before and after the target. The two candidate
+ * instants (nominal minus each offset) are then classified by asking the
+ * platform IANA database which wall time they actually carry. This handles
+ * 60-minute transitions, Australia/Lord_Howe's 30-minute transitions and
+ * Pacific/Chatham's 45-minute transition uniformly.
+ *
+ * @param y Year (1970--)
+ * @param m Month 1-12
+ * @param d Day 1-31
+ * @param h Hour 0-23
+ * @param i Minute 0-59
+ * @param s Second 0-59
+ * @param tz IANA timezone identifier
+ */
+export function resolveLocalTime(
+  y: number,
+  m: number,
+  d: number,
+  h: number,
+  i: number,
+  s: number,
+  tz: string,
+): ResolvedLocalTime {
+  const tp = createTimePoint(y, m, d, h, i, s, tz);
+  const nominalMs = timePointToMs(tp);
+
+  const matchesWall = (candidateMs: number): boolean =>
+    timePointsMatch(toTZ(new Date(candidateMs), tz), tp);
+
+  // First guess using the offset the platform reports at the nominal UTC
+  // timestamp. For the overwhelming majority of calls this is already the
+  // unique regular instant, so this path performs just two IANA lookups.
+  const guessOffsetMs = offsetAt(nominalMs, tz);
+  const guessInstantMs = nominalMs - guessOffsetMs;
+  if (matchesWall(guessInstantMs)) {
+    // Only near a transition can a second offset be in play. Sample the two
+    // real hours adjacent to the guess and see whether any other instant
+    // carries the same wall time (overlap) or whether this is post-gap.
+    const nearbyOffsets = new Set<number>([guessOffsetMs]);
+    for (const probeHours of [-3, -2, -1, 1, 2, 3]) {
+      nearbyOffsets.add(offsetAt(guessInstantMs + probeHours * 3600_000, tz));
+    }
+    let secondMs: number | undefined;
+    for (const offsetMs of nearbyOffsets) {
+      const candidateMs = nominalMs - offsetMs;
+      if (candidateMs !== guessInstantMs && matchesWall(candidateMs)) {
+        secondMs = candidateMs;
+        break;
+      }
+    }
+    if (secondMs === undefined) {
+      return { kind: "regular", instant: new Date(guessInstantMs), offsetMs: guessOffsetMs };
+    }
+    const firstMs = Math.min(guessInstantMs, secondMs);
+    const otherMs = Math.max(guessInstantMs, secondMs);
+    return {
+      kind: "overlap",
+      instant: new Date(firstMs),
+      secondInstant: new Date(otherMs),
+      offsetMs: offsetAt(firstMs, tz),
+      secondOffsetMs: offsetAt(otherMs, tz),
+    };
+  }
+
+  // The first guess does not carry the requested wall time: gap. Enumerate
+  // offsets within +/-4 real hours and map to the first existing instant
+  // after the gap (the historical Croner mapping).
+  const candidateMsList: number[] = [];
+  for (let probe = -4; probe <= 4; probe++) {
+    const offsetMs = offsetAt(guessInstantMs + probe * 3600_000, tz);
+    const candidateMs = nominalMs - offsetMs;
+    if (!candidateMsList.includes(candidateMs)) {
+      candidateMsList.push(candidateMs);
+    }
+  }
+  const mappedMs = Math.max(...candidateMsList);
+  return { kind: "gap", instant: new Date(mappedMs), offsetMs: offsetAt(mappedMs, tz) };
+}
