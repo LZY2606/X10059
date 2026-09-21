@@ -356,18 +356,6 @@ class CronDate<T = undefined> {
   }
 
   /**
-   * Find next match of current part
-   */
-  private findNext(
-    options: CronOptions<T>,
-    target: RecursionTarget,
-    pattern: CronPattern,
-    offset: number,
-  ): number {
-    return this._findMatch(options, target, pattern, offset, 1);
-  }
-
-  /**
    * Internal unified method to find a matching time component in either direction.
    * This method searches through the pattern to find the next or previous valid value
    * for the specified target component (second, minute, hour, day, or month).
@@ -381,7 +369,7 @@ class CronDate<T = undefined> {
    *
    * @private
    */
-  private _findMatch(
+  private findMatch(
     options: CronOptions<T>,
     target: RecursionTarget,
     pattern: CronPattern,
@@ -489,44 +477,64 @@ class CronDate<T = undefined> {
   }
 
   /**
-   * Increment to next run time recursively.
+   * Direction-parameterized search core for both next (forward) and previous
+   * (backward) run times.
    *
    * This function traverses the date components (year, month, day, hour, minute, second)
-   * to find the next date and time that matches the cron pattern. It uses a recursive
-   * approach to handle the dependencies between different components. For example,
-   * if the day changes, the hour, minute, and second need to be reset.
+   * to find the nearest date and time that matches the cron pattern in the requested
+   * direction. It uses a recursive approach to handle the dependencies between
+   * different components. For example, if the day changes, the hour, minute, and
+   * second need to be reset (to their minimum values when searching forward, or
+   * their maximum values when searching backward).
    *
-   * The recursion is limited to the year 10000 to prevent potential
-   * infinite loops or excessive stack depth, and to match the maximum supported
-   * year in OCPS 1.2 (years 1-9999).
+   * The forward search is limited to the year 10000 (3000 for patterns without
+   * year constraints) and the backward search to the year 0, to prevent potential
+   * infinite loops or excessive stack depth, and to match the supported year
+   * range in OCPS 1.2 (years 1-9999).
    *
-   * @param pattern The cron pattern used to determine the next run time.
-   * @param options The cron options that influence the incrementing behavior.
+   * @param pattern The cron pattern used to determine the run time.
+   * @param options The cron options that influence the search behavior.
    * @param doing The index of the `RecursionSteps` array indicating the current
    *              date component being processed. 0 represents "month", 1 represents "day", etc.
+   * @param direction 1 to search forward (next run), -1 to search backward (previous run).
+   * @param depth Recursion depth counter, used as a safety guard against infinite recursion.
    *
-   * @returns This `CronDate` instance for chaining, or null if incrementing
-   *          was not possible (e.g., reached year 10000 limit or no matching date).
+   * @returns This `CronDate` instance for chaining, or null if no matching date
+   *          exists within the supported year range.
    *
    * @private
    */
-  private recurse(
+  private seek(
     pattern: CronPattern,
     options: CronOptions<T>,
     doing: number,
+    direction: 1 | -1,
+    depth: number = 0,
   ): CronDate<T> | null {
+    // Safety: prevent unbounded recursion. Legitimate matches are always found
+    // within a 4-year leap cycle (~100 frames); deeper recursion only happens
+    // for unsolvable patterns (e.g. Feb 31), which correctly resolve to null
+    // here instead of overflowing the call stack.
+    if (depth > 1000) {
+      return null;
+    }
+
     // OCPS 1.2: Check if current year matches the year pattern at the start
     // Only check when year constraints exist and we're at month level
     if (doing === 0 && !pattern.starYear) {
-      // If current year doesn't match, find the next matching year
+      // If current year doesn't match, find the nearest matching year in the search direction
       if (
         this.year >= 0 &&
         this.year < pattern.year.length &&
         pattern.year[this.year] === 0
       ) {
-        // Find next matching year
+        // Find nearest matching year in the search direction
         let foundYear = -1;
-        for (let y = this.year + 1; y < pattern.year.length && y < 10000; y++) {
+        for (
+          let y = this.year + direction;
+          direction === 1 ? (y < pattern.year.length && y < 10000) : y >= 0;
+          y += direction
+        ) {
           if (pattern.year[y] === 1) {
             foundYear = y;
             break;
@@ -537,62 +545,181 @@ class CronDate<T = undefined> {
           return null;
         }
 
-        // Jump to the found year and reset to start of year
+        // Jump to the found year and reset to the boundary of the year in the search direction
         this.year = foundYear;
-        this.month = 0;
-        this.day = 1;
-        this.hour = 0;
-        this.minute = 0;
-        this.second = 0;
+        if (direction === 1) {
+          this.month = 0;
+          this.day = 1;
+          this.hour = 0;
+          this.minute = 0;
+          this.second = 0;
+        } else {
+          this.month = 11;
+          this.day = 31;
+          this.hour = 23;
+          this.minute = 59;
+          this.second = 59;
+        }
         this.ms = 0;
       }
 
       // Check if we've gone out of bounds
-      if (this.year >= 10000) {
+      if (direction === 1 ? this.year >= 10000 : this.year < 0) {
         return null;
       }
     }
 
-    // Find next month (or whichever part we're at)
-    const res = this.findNext(options, RecursionSteps[doing][0], pattern, RecursionSteps[doing][2]);
+    // Find the nearest matching month (or whichever part we're at) in the search direction
+    const res = this.findMatch(
+      options,
+      RecursionSteps[doing][0],
+      pattern,
+      RecursionSteps[doing][2],
+      direction,
+    );
 
     // Month (or whichever part we're at) changed
     if (res > 1) {
-      // Flag following levels for reset
+      // Flag following levels for reset, to their minimum values when searching
+      // forward, or their maximum values when searching backward
       let resetLevel = doing + 1;
       while (resetLevel < RecursionSteps.length) {
-        this[RecursionSteps[resetLevel][0]] = -RecursionSteps[resetLevel][2];
+        const target = RecursionSteps[resetLevel][0];
+        const offset = RecursionSteps[resetLevel][2];
+        if (direction === 1) {
+          this[target] = -offset;
+        } else {
+          // Day resets must never overflow the current month: apply() would
+          // roll the overflow into the next month and corrupt the search state
+          // (e.g. Feb 29 in a non-leap year became Mar 1, which crashed the
+          // backward search at the month level)
+          const maxValue = this.getMaxPatternValue(target, pattern, offset);
+          this[target] = target === "day"
+            ? Math.min(maxValue, this.getLastDayOfMonth(this.year, this.month))
+            : maxValue;
+        }
         resetLevel++;
       }
       // Parent changed
       if (res === 3) {
-        // Do increment parent, and reset current level
-        this[RecursionSteps[doing][1]]++;
-        this[RecursionSteps[doing][0]] = -RecursionSteps[doing][2];
-        this.apply();
+        // Step the parent component in the search direction
+        this[RecursionSteps[doing][1]] += direction;
 
-        // OCPS 1.2: If we just incremented the year and have year constraints, check if it matches
+        if (direction === 1) {
+          // Reset current level to its minimum, and normalize
+          this[RecursionSteps[doing][0]] = -RecursionSteps[doing][2];
+          this.apply();
+        } else {
+          // Special handling: if we just decremented year, we need to handle day overflow in the current month
+          if (doing === 0) {
+            // Get the last day of the current month (after year decrement)
+            const lastDayOfMonth = this.getLastDayOfMonth(this.year, this.month);
+
+            // If current day exceeds the last day of the month, cap it
+            if (this.day > lastDayOfMonth) {
+              this.day = lastDayOfMonth;
+            }
+          }
+
+          // Special handling: if we just decremented month, we need to handle day overflow
+          if (doing === 1) {
+            // If day is 0 or negative, set to 1 temporarily so apply() doesn't misinterpret it
+            if (this.day <= 0) {
+              this.day = 1;
+            } else {
+              // If day is too large for the new month, cap it to avoid overflow during apply()
+              // We need to check what the new month will be after normalization
+              let tempYear = this.year;
+              let tempMonth = this.month;
+
+              // Normalize month if it's out of bounds
+              while (tempMonth < 0) {
+                tempMonth += 12;
+                tempYear--;
+              }
+              while (tempMonth > 11) {
+                tempMonth -= 12;
+                tempYear++;
+              }
+
+              // Get the last day of the normalized month
+              const lastDayOfMonth = tempMonth !== 1
+                ? DaysOfMonth[tempMonth]
+                : new Date(Date.UTC(tempYear, tempMonth + 1, 0)).getUTCDate();
+
+              // If current day exceeds the last day of the new month, cap it
+              if (this.day > lastDayOfMonth) {
+                this.day = lastDayOfMonth;
+              }
+            }
+          }
+
+          // Apply to normalize the date (e.g., month -1 becomes December of previous year)
+          this.apply();
+
+          // Now reset current level to max based on the normalized date
+          const target = RecursionSteps[doing][0];
+          const offset = RecursionSteps[doing][2];
+          const maxValue = this.getMaxPatternValue(target, pattern, offset);
+
+          // For day patterns, cap at the actual last day of the current month
+          if (target === "day") {
+            const lastDayOfMonth = this.getLastDayOfMonth(this.year, this.month);
+            this[target] = Math.min(maxValue, lastDayOfMonth);
+          } else {
+            this[target] = maxValue;
+          }
+
+          // Apply again to ensure the date is valid
+          this.apply();
+
+          // After resetting the current level and normalizing, we may need to reset child levels again
+          // This happens when, for example, we cap day to 30 for November, then normalize back to December
+          // In that case, day should be reset to 31 for December
+          if (doing === 0) {
+            // We just reset month - check if day needs to be reset based on the new month
+            const dayOffset = RecursionSteps[1][2]; // offset for day
+            const dayMaxValue = this.getMaxPatternValue("day", pattern, dayOffset);
+            const lastDayOfMonth = this.getLastDayOfMonth(this.year, this.month);
+            const newDay = Math.min(dayMaxValue, lastDayOfMonth);
+            if (newDay !== this.day) {
+              this.day = newDay;
+              // Reset hour/minute/second as well since day changed
+              this.hour = this.getMaxPatternValue("hour", pattern, RecursionSteps[2][2]);
+              this.minute = this.getMaxPatternValue("minute", pattern, RecursionSteps[3][2]);
+              this.second = this.getMaxPatternValue("second", pattern, RecursionSteps[4][2]);
+            }
+          }
+        }
+
+        // OCPS 1.2: If we just stepped the year and have year constraints, check if it matches
         if (doing === 0 && !pattern.starYear) {
-          // Keep incrementing year until we find a matching one
+          // Keep stepping the year until we find a matching one
           while (
             this.year >= 0 &&
             this.year < pattern.year.length &&
             pattern.year[this.year] === 0 &&
-            this.year < 10000
+            (direction === -1 || this.year < 10000)
           ) {
-            this.year++;
+            this.year += direction;
           }
 
           // Check if we've gone out of bounds
-          if (this.year >= 10000 || this.year >= pattern.year.length) {
+          if (
+            direction === 1
+              ? (this.year >= 10000 || this.year >= pattern.year.length)
+              : this.year < 0
+          ) {
             return null;
           }
         }
 
         // Restart
-        return this.recurse(pattern, options, 0);
+        return this.seek(pattern, options, 0, direction, depth + 1);
       } else if (this.apply()) {
-        return this.recurse(pattern, options, doing - 1);
+        // The date needed normalization, re-check from the parent level.
+        // Clamped at 0, as the month level has no parent within RecursionSteps.
+        return this.seek(pattern, options, Math.max(doing - 1, 0), direction, depth + 1);
       }
     }
 
@@ -605,12 +732,14 @@ class CronDate<T = undefined> {
 
       // ... or out of bounds ?
       // Use a higher limit when year constraints exist, lower limit otherwise for performance
-    } else if (pattern.starYear ? this.year >= 3000 : this.year >= 10000) {
+    } else if (
+      direction === 1 ? (pattern.starYear ? this.year >= 3000 : this.year >= 10000) : this.year < 0
+    ) {
       return null;
 
       // ... oh, go to next part then
     } else {
-      return this.recurse(pattern, options, doing);
+      return this.seek(pattern, options, doing, direction, depth + 1);
     }
   }
 
@@ -640,7 +769,7 @@ class CronDate<T = undefined> {
     this.apply();
 
     // Recursively change each part (y, m, d ...) until next match is found, return null on failure
-    return this.recurse(pattern, options, 0);
+    return this.seek(pattern, options, 0, 1);
   }
 
   /**
@@ -664,223 +793,7 @@ class CronDate<T = undefined> {
     this.apply();
 
     // Recursively change each part (y, m, d ...) until previous match is found, return null on failure
-    return this.recurseBackward(pattern, options, 0, 0);
-  }
-
-  /**
-   * Find previous match by recursively checking pattern parts in reverse.
-   *
-   * This is the backward equivalent of the recurse() method. It searches backwards
-   * through time to find the previous date/time that matches the cron pattern.
-   *
-   * @param pattern The cron pattern used to determine the previous run time.
-   * @param options The cron options that influence the decrementing behavior.
-   * @param doing The index of the `RecursionSteps` array indicating the current
-   *              date component being processed.
-   *
-   * @returns This `CronDate` instance for chaining, or null if decrementing
-   *          was not possible (e.g., reached year 0 or no matching date).
-   *
-   * @private
-   */
-  private recurseBackward(
-    pattern: CronPattern,
-    options: CronOptions<T>,
-    doing: number,
-    depth: number = 0,
-  ): CronDate<T> | null {
-    // Safety: prevent infinite recursion
-    if (depth > 10000) {
-      return null;
-    }
-
-    // OCPS 1.2: Check if current year matches the year pattern at the start
-    // Only check when year constraints exist and we're at month level
-    if (doing === 0 && !pattern.starYear) {
-      // If current year doesn't match, find the previous matching year
-      if (
-        this.year >= 0 &&
-        this.year < pattern.year.length &&
-        pattern.year[this.year] === 0
-      ) {
-        // Find previous matching year
-        let foundYear = -1;
-        for (let y = this.year - 1; y >= 0; y--) {
-          if (pattern.year[y] === 1) {
-            foundYear = y;
-            break;
-          }
-        }
-
-        if (foundYear === -1) {
-          return null;
-        }
-
-        // Jump to the found year and reset to end of year
-        this.year = foundYear;
-        this.month = 11;
-        this.day = 31;
-        this.hour = 23;
-        this.minute = 59;
-        this.second = 59;
-        this.ms = 0;
-      }
-
-      // Check if we've gone out of bounds
-      if (this.year < 0) {
-        return null;
-      }
-    }
-
-    // Find previous match for current component
-    const res = this.findPrevious(
-      options,
-      RecursionSteps[doing][0],
-      pattern,
-      RecursionSteps[doing][2],
-    );
-
-    // Component changed
-    if (res > 1) {
-      // Flag following levels for reset to their maximum values
-      let resetLevel = doing + 1;
-      while (resetLevel < RecursionSteps.length) {
-        // Reset to maximum valid value for each component
-        const target = RecursionSteps[resetLevel][0];
-        const offset = RecursionSteps[resetLevel][2];
-
-        // Find the maximum valid value in the pattern
-        const maxValue = this.getMaxPatternValue(target, pattern, offset);
-        this[target] = maxValue;
-
-        resetLevel++;
-      }
-
-      // Parent changed
-      if (res === 3) {
-        // Decrement parent
-        this[RecursionSteps[doing][1]]--;
-
-        // Special handling: if we just decremented year, we need to handle day overflow in the current month
-        if (doing === 0) {
-          // Get the last day of the current month (after year decrement)
-          const lastDayOfMonth = this.getLastDayOfMonth(this.year, this.month);
-
-          // If current day exceeds the last day of the month, cap it
-          if (this.day > lastDayOfMonth) {
-            this.day = lastDayOfMonth;
-          }
-        }
-
-        // Special handling: if we just decremented month, we need to handle day overflow
-        if (doing === 1) {
-          // If day is 0 or negative, set to 1 temporarily so apply() doesn't misinterpret it
-          if (this.day <= 0) {
-            this.day = 1;
-          } else {
-            // If day is too large for the new month, cap it to avoid overflow during apply()
-            // We need to check what the new month will be after normalization
-            let tempYear = this.year;
-            let tempMonth = this.month;
-
-            // Normalize month if it's out of bounds
-            while (tempMonth < 0) {
-              tempMonth += 12;
-              tempYear--;
-            }
-            while (tempMonth > 11) {
-              tempMonth -= 12;
-              tempYear++;
-            }
-
-            // Get the last day of the normalized month
-            const lastDayOfMonth = tempMonth !== 1
-              ? DaysOfMonth[tempMonth]
-              : new Date(Date.UTC(tempYear, tempMonth + 1, 0)).getUTCDate();
-
-            // If current day exceeds the last day of the new month, cap it
-            if (this.day > lastDayOfMonth) {
-              this.day = lastDayOfMonth;
-            }
-          }
-        }
-
-        // Apply to normalize the date (e.g., month -1 becomes December of previous year)
-        this.apply();
-
-        // Now reset current level to max based on the normalized date
-        const target = RecursionSteps[doing][0];
-        const offset = RecursionSteps[doing][2];
-        const maxValue = this.getMaxPatternValue(target, pattern, offset);
-
-        // For day patterns, cap at the actual last day of the current month
-        if (target === "day") {
-          const lastDayOfMonth = this.getLastDayOfMonth(this.year, this.month);
-          this[target] = Math.min(maxValue, lastDayOfMonth);
-        } else {
-          this[target] = maxValue;
-        }
-
-        // Apply again to ensure the date is valid
-        this.apply();
-
-        // After resetting the current level and normalizing, we may need to reset child levels again
-        // This happens when, for example, we cap day to 30 for November, then normalize back to December
-        // In that case, day should be reset to 31 for December
-        if (doing === 0) {
-          // We just reset month - check if day needs to be reset based on the new month
-          const dayOffset = RecursionSteps[1][2]; // offset for day
-          const dayMaxValue = this.getMaxPatternValue("day", pattern, dayOffset);
-          const lastDayOfMonth = this.getLastDayOfMonth(this.year, this.month);
-          const newDay = Math.min(dayMaxValue, lastDayOfMonth);
-          if (newDay !== this.day) {
-            this.day = newDay;
-            // Reset hour/minute/second as well since day changed
-            this.hour = this.getMaxPatternValue("hour", pattern, RecursionSteps[2][2]);
-            this.minute = this.getMaxPatternValue("minute", pattern, RecursionSteps[3][2]);
-            this.second = this.getMaxPatternValue("second", pattern, RecursionSteps[4][2]);
-          }
-        }
-
-        // OCPS 1.2: If we just decremented the year and have year constraints, check if it matches
-        if (doing === 0 && !pattern.starYear) {
-          // Keep decrementing year until we find a matching one
-          while (
-            this.year >= 0 &&
-            this.year < pattern.year.length &&
-            pattern.year[this.year] === 0
-          ) {
-            this.year--;
-          }
-
-          // Check if we've gone out of bounds
-          if (this.year < 0) {
-            return null;
-          }
-        }
-
-        // Restart
-        return this.recurseBackward(pattern, options, 0, depth + 1);
-      } else if (this.apply()) {
-        return this.recurseBackward(pattern, options, doing - 1, depth + 1);
-      }
-    }
-
-    // Move to next level
-    doing += 1;
-
-    // Done?
-    if (doing >= RecursionSteps.length) {
-      return this;
-
-      // ... or out of bounds ?
-    } else if (this.year < 0) {
-      return null;
-
-      // ... oh, go to next part then
-    } else {
-      return this.recurseBackward(pattern, options, doing, depth + 1);
-    }
+    return this.seek(pattern, options, 0, -1);
   }
 
   /**
@@ -922,27 +835,6 @@ class CronDate<T = undefined> {
     // Fallback: return the pattern length minus offset
     // This ensures we at least try searching from a reasonable upper bound
     return pattern[target].length - 1 - offset;
-  }
-
-  /**
-   * Find previous match for a specific component going backwards in time.
-   * This is the backward equivalent of the findNext() method.
-   *
-   * @param options Cron options
-   * @param target Target property (second, minute, hour, day, month)
-   * @param pattern Pattern to use
-   * @param offset Offset to use
-   * @returns Status code: 1 = same value matches, 2 = value changed to earlier value, 3 = no match found
-   *
-   * @private
-   */
-  private findPrevious(
-    options: CronOptions<T>,
-    target: RecursionTarget,
-    pattern: CronPattern,
-    offset: number,
-  ): number {
-    return this._findMatch(options, target, pattern, offset, -1);
   }
 
   /**
@@ -1024,7 +916,7 @@ class CronDate<T = undefined> {
       }
     }
 
-    // Check each component using the existing findNext logic
+    // Check each component using the existing findMatch logic
     // by checking if each component at its current value matches
     for (let doing = 0; doing < RecursionSteps.length; doing++) {
       const target = RecursionSteps[doing][0];
@@ -1038,7 +930,7 @@ class CronDate<T = undefined> {
 
       let match: number = pattern[target][targetValue + offset];
 
-      // Apply the same special cases as in findNext
+      // Apply the same special cases as in findMatch
       if (target === "day") {
         // Special case for nearest weekday (W modifier)
         if (!match) {
@@ -1082,7 +974,7 @@ class CronDate<T = undefined> {
               : 0;
           }
 
-          // Apply same logic as in findNext for combining day of month and day of week
+          // Apply same logic as in findMatch for combining day of month and day of week
           if (pattern.useAndLogic) {
             match = match && dowMatch;
           } else if (!options.domAndDow && !pattern.starDOM) {

@@ -130,6 +130,53 @@ export function fromTZISO(localTimeStr: string, tz?: string, throwOnInvalid?: bo
  * @returns Normal date object
  */
 export function fromTZ(tp: TimePoint, throwOnInvalid?: boolean): Date {
+  const resolution = resolveDSTTransition(tp);
+
+  if (resolution.classification === "gap" && throwOnInvalid) {
+    // Input time is invalid, and the library is instructed to throw
+    throw new Error("Invalid date passed to fromTZ()");
+  }
+
+  return resolution.date;
+}
+
+/**
+ * Classification of a local time point with respect to DST transitions
+ *
+ * - "unique": the local time maps to exactly one UTC instant
+ * - "gap": the local time does not exist (spring forward)
+ * - "overlap": the local time exists twice (fall back)
+ */
+export type DSTClassification = "unique" | "gap" | "overlap";
+
+/**
+ * Result of the explicit DST transition guard: how the local time is
+ * classified, and the UTC instant it deterministically resolves to.
+ */
+export interface DSTResolution {
+  classification: DSTClassification;
+  date: Date;
+}
+
+/**
+ * Explicit DST transition guard.
+ *
+ * Probes how a local time point in a specific timezone maps to UTC and
+ * classifies it as "unique", "gap" (nonexistent local time) or "overlap"
+ * (repeated local time). The resolution is deterministic:
+ *
+ * - unique: the single matching UTC instant
+ * - overlap: the first occurrence (earlier UTC instant), per OCPS 1.4
+ * - gap: the first valid instant after the gap
+ *
+ * Both the forward (next) and backward (previous) calendar searches convert
+ * their local-time results through this single guard, which keeps the two
+ * directions consistent at DST transition boundaries.
+ *
+ * @param tp - TimePoint with specified timezone
+ * @returns Classification and resolved UTC instant
+ */
+export function resolveDSTTransition(tp: TimePoint): DSTResolution {
   // Construct a Date object with UTC components matching the target local time
   const inDate = new Date(timePointToMs(tp));
 
@@ -147,18 +194,30 @@ export function fromTZ(tp: TimePoint, throwOnInvalid?: boolean): Date {
 
   // Check if the first guess produces the target local time
   if (timePointsMatch(check1, tp)) {
-    // Even if it matches, we might be in a DST overlap (fall back)
-    // Check if there's another valid time 1 hour earlier
-    const altGuess = new Date(dateGuess.getTime() - 3600000); // 1 hour earlier
-    const altCheck = toTZ(altGuess, tp.tz!);
-
-    // If the earlier time also produces the same local time, we're in a DST overlap
-    if (timePointsMatch(altCheck, tp)) {
-      // Return the earlier time (first occurrence per OCPS 1.4)
-      return altGuess;
+    // Even if it matches, we might be in a DST overlap (fall back).
+    // Probe for other UTC instants that produce the same local time.
+    // One hour covers regular DST transitions, 30 minutes covers
+    // half-hour transitions (e.g. Australia/Lord_Howe).
+    let earliest = dateGuess;
+    let isOverlap = false;
+    for (const shiftMs of [-3600000, 3600000, -1800000, 1800000]) {
+      const altGuess = new Date(dateGuess.getTime() + shiftMs);
+      const altCheck = toTZ(altGuess, tp.tz!);
+      if (timePointsMatch(altCheck, tp)) {
+        isOverlap = true;
+        if (altGuess.getTime() < earliest.getTime()) {
+          earliest = altGuess;
+        }
+      }
     }
 
-    return dateGuess;
+    // If another instant also produces the same local time, we're in a DST overlap
+    if (isOverlap) {
+      // Return the earliest instant (first occurrence per OCPS 1.4)
+      return { classification: "overlap", date: earliest };
+    }
+
+    return { classification: "unique", date: dateGuess };
   }
 
   // First guess didn't match, refine with a second iteration
@@ -167,17 +226,15 @@ export function fromTZ(tp: TimePoint, throwOnInvalid?: boolean): Date {
 
   if (timePointsMatch(check2, tp)) {
     // Second guess matches
-    return dateGuess2;
+    return { classification: "unique", date: dateGuess2 };
   }
 
-  if (!throwOnInvalid) {
-    // Neither guess matches exactly - we're in a DST gap (spring forward)
-    // Return the time after the gap (the later of the two)
-    return dateGuess.getTime() > dateGuess2.getTime() ? dateGuess : dateGuess2;
-  } else {
-    // Input time is invalid, and the library is instructed to throw
-    throw new Error("Invalid date passed to fromTZ()");
-  }
+  // Neither guess matches exactly - we're in a DST gap (spring forward)
+  // Resolve to the time after the gap (the later of the two)
+  return {
+    classification: "gap",
+    date: dateGuess.getTime() > dateGuess2.getTime() ? dateGuess : dateGuess2,
+  };
 }
 
 /**
